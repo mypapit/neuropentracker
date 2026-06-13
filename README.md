@@ -1,8 +1,7 @@
 # Neuropentracker
-Summary: Documents Neuropentracker installation, configuration, and operation.
-Copyright (c) 2026 Neuropentracker contributors.
-License: BSD-2-Clause. See [LICENSE](LICENSE) for details.
-Neuropentracker is a small BitTorrent tracker for PHP 7.4 through PHP 8.3.
+- Copyright (c) 2026 Neuropentracker contributors.
+- License: BSD-2-Clause. See [LICENSE](LICENSE) for details.
+- Neuropentracker is a small BitTorrent tracker for PHP 7.4 through PHP 8.3.
 
 ## License
 This code is licensed under the BSD 2-Clause License. See [LICENSE](LICENSE) for the full license text.
