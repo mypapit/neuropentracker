@@ -1,0 +1,9 @@
+<?php
+/*
+ * Neuropentracker
+ * Summary: Extensionless wrapper that loads the announce endpoint.
+ * Copyright (c) 2026 Neuropentracker contributors.
+ * License: BSD-2-Clause.
+ */
+
+require __DIR__ . '/announce.php';
