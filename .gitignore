@@ -1,0 +1,23 @@
+# Local configuration overrides and anything an operator produces at runtime.
+config.local.php
+*.local.php
+
+# Editor and OS noise.
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Never commit a database dump, backup, or log.
+*.sql.bak
+*.bak
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# The app writes nothing here today, but the docroot is a tempting place to
+# leave a scratch copy of config.inc.php. Do not let one in.
+config.inc.php.bak
+config.inc.php.orig

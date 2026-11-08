@@ -4,17 +4,26 @@
  * Summary: Encodes and decodes BitTorrent bencoded values.
  * Copyright (c) 2026 Neuropentracker contributors.
  * License: BSD-2-Clause.
- * Compatible with PHP 7.4 through PHP 8.3.
+ * Requires PHP 8.3 or 8.4 (tested on 8.3.36 and 8.4.27).
  */
 
 function bdecode(string $str)
 {
     $pos = 0;
-    return bdecode_r($str, $pos);
+    return bdecode_r($str, $pos, 0);
 }
 
-function bdecode_r(string $str, int &$pos)
+/*
+ * $depth bounds recursion. Each nesting level previously consumed a stack
+ * frame and an array, so a few hundred thousand 'l' bytes exhausted memory and
+ * killed the process. Nothing parseable is ever this deep.
+ */
+function bdecode_r(string $str, int &$pos, int $depth = 0)
 {
+    if ($depth > 64) {
+        return null;
+    }
+
     $strlen = strlen($str);
     if ($pos < 0 || $pos >= $strlen) {
         return null;
@@ -44,12 +53,12 @@ function bdecode_r(string $str, int &$pos)
                 return $ret;
             }
 
-            $key = bdecode_r($str, $pos);
+            $key = bdecode_r($str, $pos, $depth + 1);
             if ($key === null) {
                 return null;
             }
 
-            $val = bdecode_r($str, $pos);
+            $val = bdecode_r($str, $pos, $depth + 1);
             if ($val === null) {
                 return null;
             }
@@ -72,7 +81,7 @@ function bdecode_r(string $str, int &$pos)
                 return $ret;
             }
 
-            $val = bdecode_r($str, $pos);
+            $val = bdecode_r($str, $pos, $depth + 1);
             if ($val === null) {
                 return null;
             }

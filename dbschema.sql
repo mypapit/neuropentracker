@@ -5,6 +5,13 @@
 # License: BSD-2-Clause.
 # Compatible with current MySQL and MariaDB versions.
 #
+# MAX_ROWS is a deliberate safety valve. The MEMORY engine has no eviction
+# policy: once the table reaches max_heap_table_size every INSERT fails with
+# "The table 'peers' is full" and the tracker serves nothing but errors until
+# an operator empties it. An explicit row cap fails earlier, at a size the
+# configured heap is guaranteed to have room for, so a burst degrades instead
+# of bricking the process. Keep clean.php on a cron schedule alongside it.
+#
 
 DROP TABLE IF EXISTS `peers`;
 CREATE TABLE `peers` (
@@ -22,4 +29,4 @@ CREATE TABLE `peers` (
   KEY `update_time` (`update_time`),
   KEY `info_hash_expire` (`info_hash`, `expire_time`),
   KEY `peer_id` (`peer_id`)
-) ENGINE=MEMORY DEFAULT CHARSET=binary;
+) ENGINE=MEMORY MAX_ROWS=50000 DEFAULT CHARSET=binary;

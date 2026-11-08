@@ -4,7 +4,7 @@
  * Summary: Provides shared database, response, IP, and access-list helpers.
  * Copyright (c) 2026 Neuropentracker contributors.
  * License: BSD-2-Clause.
- * Compatible with PHP 7.4 through PHP 8.3.
+ * Requires PHP 8.3 or 8.4 (tested on 8.3.36 and 8.4.27).
  */
 
 require_once __DIR__ . '/bencoding.inc.php';
@@ -37,6 +37,18 @@ function tracker_db(): mysqli
     $port = (int) tracker_config('db_port', ini_get('mysqli.default_port') ?: 3306);
     $socket = tracker_config('db_socket', null);
 
+    /*
+     * Refuse a privileged or passwordless account. The shipped default used to
+     * be root with an empty password, which is a superuser one guess away on a
+     * host where MySQL is not bound to loopback. Failing here is louder and
+     * safer than connecting successfully.
+     */
+    if (!tracker_config('db_allow_privileged', false)) {
+        if ((string) $user === 'root' || (string) $pass === '') {
+            tracker_failure('database account is privileged or passwordless; see config.inc.php');
+        }
+    }
+
     $db = @new mysqli($server, $user, $pass, $name, $port, $socket);
     if ($db->connect_errno) {
         tracker_failure('database unavailable');
@@ -44,6 +56,37 @@ function tracker_db(): mysqli
 
     @$db->set_charset('binary');
     return $db;
+}
+
+/*
+ * How many peer rows the tracker will hold before refusing new ones.
+ *
+ * The MEMORY engine has no eviction: once max_heap_table_size is hit every
+ * INSERT fails and the tracker serves nothing but "database error" until an
+ * operator empties the table. MAX_ROWS in the schema is not a reliable ceiling
+ * either — MariaDB ignores it when the heap limit is lower, which is exactly
+ * the case it was meant to protect.
+ *
+ * So the cap is enforced here, below the heap ceiling, where it can produce a
+ * comprehensible failure instead of a silent brick.
+ */
+function tracker_peer_capacity(): int
+{
+    return max(1, (int) tracker_config('max_peers', 40000));
+}
+
+/*
+ * True when there is no room for another peer.
+ *
+ * COUNT(*) on a MEMORY table is a constant-time row count (measured 0.026 ms at
+ * 52k rows), so this is cheap enough to run on every announce.
+ */
+function tracker_peer_table_full(): bool
+{
+    $table = tracker_table_name();
+    $count = tracker_scalar("SELECT COUNT(*) FROM $table");
+
+    return $count >= tracker_peer_capacity();
 }
 
 function tracker_table_name(): string
@@ -122,19 +165,101 @@ function tracker_client_ip(): string
     return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
 }
 
+/*
+ * Parse an IPv4 literal. Returns an unsigned int, or false.
+ *
+ * Deliberately does NOT fall back to gethostbyname(): a tracker was never
+ * meant to resolve attacker-supplied names, and doing so allowed any anonymous
+ * client to (a) make the server do a blocking DNS lookup per request and
+ * (b) use the resolve/no-resolve distinction as an internal hostname oracle,
+ * with the resolved internal address then published in the peer list.
+ */
 function tracker_resolve_ip(string $host)
 {
-    $ip = ip2long($host);
-    if ($ip === false) {
-        $resolved = gethostbyname($host);
-        $ip = ip2long($resolved);
+    $host = trim($host);
+    if ($host === '' || strpos($host, "\0") !== false) {
+        return false;
     }
 
+    // ip2long() accepts shorthands such as "127.1"; require a dotted quad so
+    // that access-list text and stored addresses cannot disagree.
+    if (!preg_match('/^\d{1,3}(\.\d{1,3}){3}$/', $host)) {
+        return false;
+    }
+
+    $ip = ip2long($host);
     if ($ip === false) {
         return false;
     }
 
     return (int) sprintf('%u', $ip);
+}
+
+/*
+ * The address this announce is allowed to claim, and the address access lists
+ * are evaluated against.
+ *
+ * The socket address (REMOTE_ADDR) is authoritative. A ?ip= override is honoured
+ * only when $trust_forwarded_ip is explicitly enabled in config.inc.php.
+ *
+ * Trust is deliberately NOT inferred from the source address being private or
+ * loopback. Behind a reverse proxy on the same host, REMOTE_ADDR is 127.0.0.1
+ * for every client, so "it came from loopback" would have re-opened the bypass
+ * for every proxied deployment. An explicit opt-in cannot be fooled that way.
+ *
+ * Returns array(socketIp:int, claimedIp:int).
+ */
+function tracker_announce_addresses(): array
+{
+    $socketRaw = tracker_client_ip();
+    $socketIp = tracker_resolve_ip($socketRaw);
+
+    if ($socketIp === false) {
+        tracker_failure('unable to determine client address');
+    }
+
+    $claimedIp = $socketIp;
+
+    if (!isset($_GET['ip']) || !is_string($_GET['ip']) || $_GET['ip'] === '') {
+        return array($socketIp, $claimedIp);
+    }
+
+    /*
+     * Validate the claim whether or not we intend to honour it. Silently
+     * accepting garbage hides probing and misconfiguration behind a normal
+     * response, and "0" used to be stored and published as 0.0.0.0.
+     */
+    $claimed = tracker_resolve_ip((string) $_GET['ip']);
+    if ($claimed === false || $claimed === 0) {
+        tracker_failure('invalid ip parameter');
+    }
+
+    if (tracker_config('trust_forwarded_ip', false)) {
+        $claimedIp = $claimed;
+    }
+
+    return array($socketIp, $claimedIp);
+}
+
+/*
+ * Emit hardening headers. Called from each endpoint. There is no session and
+ * no script on the tracker endpoints, so a strict CSP is safe there; the
+ * dashboard embeds its stylesheet inline and needs style-src 'unsafe-inline'.
+ */
+function tracker_security_headers(bool $allowInlineStyle = false): void
+{
+    if (!headers_sent()) {
+        header('X-Content-Type-Options: nosniff');
+        header('X-Frame-Options: DENY');
+        header('Referrer-Policy: no-referrer');
+        header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
+
+        $style = $allowInlineStyle ? "'unsafe-inline'" : "'none'";
+        header("Content-Security-Policy: default-src 'none'; style-src $style; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+    }
+
+    // Do not advertise the PHP version.
+    header_remove('X-Powered-By');
 }
 
 function tracker_ip_rule_matches(string $ip, string $rule): bool
@@ -254,8 +379,21 @@ function tracker_announce_interval(): int
     $announceRate = tracker_scalar("SELECT COUNT(*) FROM $table WHERE `update_time` > NOW() - INTERVAL 1 MINUTE");
     $maxRate = max(1, (int) tracker_config('max_announce_rate', 500));
     $minimum = (int) tracker_config('min_announce_interval', 900);
+    $maximum = (int) tracker_config('max_announce_interval', 1800);
 
-    return (int) max(($numPeers * $announceRate / ($maxRate * $maxRate)) * 60, $minimum);
+    if ($maximum < $minimum) {
+        $maximum = $minimum;
+    }
+
+    $computed = (int) (($numPeers * $announceRate / ($maxRate * $maxRate)) * 60);
+
+    /*
+     * Clamp at both ends. Both operands are attacker-influenced: a client can
+     * register thousands of peers to drive $numPeers up, which previously let
+     * the advertised interval climb past 24 hours. Once clients honour a
+     * day-long interval the swarm stops refreshing and quietly empties.
+     */
+    return (int) min(max($computed, $minimum), $maximum);
 }
 
 function tracker_response_with_id(array $payload): array
@@ -293,7 +431,35 @@ function tracker_info_hashes_from_query(): array
 function tracker_dashboard_allowed(): bool
 {
     $key = (string) tracker_config('dashboard_key', '');
-    return $key === '' || hash_equals($key, (string) ($_GET['key'] ?? ''));
+
+    /*
+     * An empty key is a misconfiguration, not "no check required". Failing
+     * closed here is what stops a default install from publishing the peer
+     * list to the internet.
+     */
+    if ($key === '') {
+        return false;
+    }
+
+    $presented = '';
+
+    // Preferred: a header, so the secret never reaches an access log.
+    if (isset($_SERVER['HTTP_X_DASHBOARD_KEY'])) {
+        $presented = (string) $_SERVER['HTTP_X_DASHBOARD_KEY'];
+    } elseif (isset($_GET['key']) && is_string($_GET['key'])) {
+        $presented = (string) $_GET['key'];
+    }
+
+    return $presented !== '' && hash_equals($key, $presented);
+}
+
+/*
+ * Reduce a peer address to its network for display, so the dashboard shows
+ * swarm shape without handing out a list of identifiable downloaders.
+ */
+function tracker_redact_ip(int $ip): string
+{
+    return long2ip($ip & 0xFFFFFF00) . '/24';
 }
 
 function tracker_hex(string $binary): string

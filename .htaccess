@@ -1,0 +1,53 @@
+# Neuropentracker
+# Apache configuration for the tracker directory.
+#
+# README.md and readme.txt both reference this file as the mechanism that
+# protects shared includes and routes the extensionless announce/scrape
+# wrappers. It was documented but never shipped, so /announce and /scrape were
+# served as literal PHP source. Keep this file in version control.
+#
+# Requires: AllowOverride All (or at least FileInfo) on this directory, and
+# mod_headers for the security headers below.
+
+# No directory listings, no directory index.
+Options -Indexes
+DirectoryIndex disabled
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set Referrer-Policy "no-referrer"
+    Header always unset X-Powered-By
+</IfModule>
+
+# Shared includes are never served. They are only meant to be require'd.
+<FilesMatch "\.(inc\.php)$">
+    Require all denied
+</FilesMatch>
+
+# The handler itself must not be callable from the web: it is maintenance.
+<FilesMatch "^clean\.php$">
+    Require all denied
+</FilesMatch>
+
+# Local configuration and database artefacts. config.inc.php is required by the
+# app but must never be fetchable; PHP executes it, so denying it is safe.
+<FilesMatch "^(config\.inc\.php|dbschema\.sql|readme\.txt|README\.md)$">
+    Require all denied
+</FilesMatch>
+
+# Route the extensionless wrappers into the PHP handler instead of serving the
+# source. Without this the documented announce URL returns the file verbatim.
+#
+# An internal rewrite is used rather than ForceType: PHP-FPM configs bind the
+# handler to the .php extension via <FilesMatch "\.php$"> SetHandler, so setting
+# a content type on a file with no extension never reaches the PHP engine and
+# the source is served as text.
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^announce$ announce.php [L]
+    RewriteRule ^scrape$ scrape.php [L]
+</IfModule>
+
+# No git metadata, ever.
+RedirectMatch 404 /\.git

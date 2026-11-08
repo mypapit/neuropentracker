@@ -4,36 +4,48 @@
  * Summary: Handles BitTorrent announce requests and returns peer lists.
  * Copyright (c) 2026 Neuropentracker contributors.
  * License: BSD-2-Clause.
- * Compatible with PHP 7.4 through PHP 8.3.
+ * Requires PHP 8.3 or 8.4 (tested on 8.3.36 and 8.4.27).
  */
 
 require_once __DIR__ . '/tracker.inc.php';
 
 header('Content-Type: text/plain');
+tracker_security_headers();
 
 $event = $_GET['event'] ?? '';
 $validEvent = $event === '' || in_array($event, array('started', 'completed', 'stopped'), true);
-$infoHash = (string) ($_GET['info_hash'] ?? '');
-$peerId = (string) ($_GET['peer_id'] ?? '');
+$infoHash = is_string($_GET['info_hash'] ?? null) ? (string) $_GET['info_hash'] : '';
+$peerId = is_string($_GET['peer_id'] ?? null) ? (string) $_GET['peer_id'] : '';
 $port = $_GET['port'] ?? null;
 $uploaded = $_GET['uploaded'] ?? null;
 $downloaded = $_GET['downloaded'] ?? null;
 $left = $_GET['left'] ?? null;
 
+/*
+ * Byte counters land in BIGINT UNSIGNED. Bound them by length here so an absurd
+ * value is reported as a bad request instead of surfacing to the client as a
+ * generic "database error".
+ */
+$counterOk = function ($value): bool {
+    if (!is_string($value) && !is_int($value)) {
+        return false;
+    }
+    $value = (string) $value;
+
+    return ctype_digit($value) && strlen($value) <= 20;
+};
+
 if (
+    !$validEvent ||
     strlen($infoHash) !== 20 ||
     strlen($peerId) !== 20 ||
-    $port === null ||
-    !ctype_digit((string) $port) ||
+    !is_string($port) ||
+    !ctype_digit($port) ||
     (int) $port < 1 ||
     (int) $port > 65535 ||
-    $uploaded === null ||
-    !ctype_digit((string) $uploaded) ||
-    $downloaded === null ||
-    !ctype_digit((string) $downloaded) ||
-    $left === null ||
-    !ctype_digit((string) $left) ||
-    !$validEvent
+    !$counterOk($uploaded) ||
+    !$counterOk($downloaded) ||
+    !$counterOk($left)
 ) {
     tracker_failure('invalid request (see http://bitconjurer.org/BitTorrent/protocol.html)');
 }
@@ -49,22 +61,102 @@ if ($requireProtocol === 'no_peer_id') {
     }
 }
 
-$requestedIp = (string) ($_GET['ip'] ?? tracker_client_ip());
-$ip = tracker_resolve_ip($requestedIp);
-if ($ip === false) {
-    tracker_failure('unable to resolve host name ' . $requestedIp);
+/*
+ * Resolve addresses. The socket address is authoritative for access control; a
+ * ?ip= claim is honoured only when the request came from a trusted proxy.
+ */
+list($socketIp, $claimedIp) = tracker_announce_addresses();
+
+if ($claimedIp === 0) {
+    tracker_failure('invalid ip parameter');
 }
 
 $accessReason = null;
-if (!tracker_access_allowed(long2ip($ip), $peerId, $accessReason)) {
+if (!tracker_access_allowed(long2ip($socketIp), $peerId, $accessReason)) {
     tracker_failure($accessReason ?? 'access denied');
 }
 
+$ip = $claimedIp;
 $announceInterval = tracker_announce_interval();
-$expireSeconds = $event === 'stopped' ? 0 : (int) ceil($announceInterval * (float) tracker_config('expire_factor', 1.2));
 $table = tracker_table_name();
 
-tracker_stmt(
+/*
+ * Refuse a new peer when the tracker is at capacity, with a message that tells
+ * the operator what to do. Without this the MEMORY table hits its heap ceiling
+ * and every announce — new or repeating — fails with a bare "database error".
+ *
+ * A `stopped` event is exempt: it removes a row and is how space is reclaimed.
+ * A repeat announce for an existing peer is also exempt, so the swarm does not
+ * vanish the moment the cap is reached.
+ */
+$existingRow = null;
+$lookup = tracker_stmt(
+    "SELECT `port`
+       FROM $table
+      WHERE `info_hash` = ?
+        AND `ip` = ?
+        AND `port` = ?
+      LIMIT 1",
+    'sii',
+    array($infoHash, $ip, (int) $port)
+);
+$existingRow = tracker_stmt_result($lookup)->fetch_assoc();
+$lookup->close();
+
+if ($existingRow === null && $event !== 'stopped' && tracker_peer_table_full()) {
+    tracker_failure('tracker is at peer capacity; try again later');
+}
+
+/*
+ * Enforce the announce interval. The tracker advertises this value in every
+ * response; before this check it was never enforced, so one client could issue
+ * hundreds of announces per second and exhaust the fixed-size peer table.
+ *
+ * The comparison is done in SQL deliberately. PHP's timezone and MySQL's can
+ * differ (UTC versus SYSTEM here), so computing the delta in PHP from a
+ * DATETIME string produced an offset that was wrong by the timezone gap, and
+ * the guard silently never fired.
+ */
+if ($existingRow !== null && $event !== 'stopped') {
+    $tooSoon = tracker_stmt(
+        "SELECT `update_time` < NOW() - INTERVAL ? SECOND AS too_soon
+           FROM $table
+          WHERE `info_hash` = ?
+            AND `ip` = ?
+            AND `port` = ?
+          LIMIT 1",
+        'isii',
+        array(max(1, $announceInterval - 60), $infoHash, $ip, (int) $port)
+    );
+    $tooSoonRow = tracker_stmt_result($tooSoon)->fetch_assoc();
+    $tooSoon->close();
+
+    if ($tooSoonRow && (int) $tooSoonRow['too_soon'] === 0) {
+        tracker_failure('announce too soon; wait ' . $announceInterval . ' seconds');
+    }
+}
+
+/*
+ * A stop must not be stored. Writing an immediately-expired row left the entry
+ * in the table for the whole clean-up retention window, making "stopped" the
+ * cheapest possible way to consume a fixed-size table.
+ */
+if ($event === 'stopped') {
+    tracker_stmt(
+        "DELETE FROM $table WHERE `info_hash` = ? AND `ip` = ? AND `port` = ?",
+        'sii',
+        array($infoHash, $ip, (int) $port)
+    );
+
+    exit(bencode(tracker_response_with_id(array(
+        'interval' => $announceInterval,
+        'peers' => array(),
+    ))));
+}
+
+$expireSeconds = (int) ceil($announceInterval * (float) tracker_config('expire_factor', 1.2));
+
+$stmt = tracker_stmt(
     "REPLACE INTO $table
         (`info_hash`, `ip`, `port`, `peer_id`, `uploaded`, `downloaded`, `left`, `expire_time`)
      VALUES
@@ -81,6 +173,7 @@ tracker_stmt(
         $expireSeconds,
     )
 );
+$stmt->close();
 
 $numwant = isset($_GET['numwant']) && ctype_digit((string) $_GET['numwant']) ? (int) $_GET['numwant'] : 50;
 $numwant = max(0, min($numwant, 200));
@@ -97,12 +190,16 @@ $stmt = tracker_stmt(
 );
 $result = tracker_stmt_result($stmt);
 
-if (!empty($_REQUEST['compact'])) {
+/*
+ * $_GET throughout. $_REQUEST also carries cookies on hosts configured with
+ * request_order=GPC, which let a cookie silently switch the response encoding.
+ */
+if (!empty($_GET['compact'])) {
     $peers = '';
     while ($row = $result->fetch_assoc()) {
         $peers .= pack('Nn', (int) $row['ip'], (int) $row['port']);
     }
-} elseif (!empty($_REQUEST['no_peer_id'])) {
+} elseif (!empty($_GET['no_peer_id'])) {
     $peers = array();
     while ($row = $result->fetch_assoc()) {
         $peers[] = array('ip' => long2ip((int) $row['ip']), 'port' => (int) $row['port']);

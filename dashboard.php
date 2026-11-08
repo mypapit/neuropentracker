@@ -4,20 +4,25 @@
  * Summary: Displays read-only tracker statistics and recent peer activity.
  * Copyright (c) 2026 Neuropentracker contributors.
  * License: BSD-2-Clause.
- * Compatible with PHP 7.4 through PHP 8.3.
+ * Requires PHP 8.3 or 8.4 (tested on 8.3.36 and 8.4.27).
  */
 
 require_once __DIR__ . '/tracker.inc.php';
 
-if (!tracker_config('dashboard_enabled', true)) {
+if (!tracker_config('dashboard_enabled', false)) {
+    tracker_security_headers();
     http_response_code(404);
     exit('Dashboard disabled');
 }
 
 if (!tracker_dashboard_allowed()) {
+    tracker_security_headers();
     http_response_code(403);
     exit('Dashboard key required');
 }
+
+// The page carries an inline stylesheet, so style-src needs 'unsafe-inline'.
+tracker_security_headers(true);
 
 function dashboard_e($value): string
 {
@@ -85,7 +90,7 @@ $result->free();
 
 $peers = array();
 $result = tracker_query(
-    "SELECT `info_hash`, `ip`, `port`, `peer_id`, `uploaded`, `downloaded`, `left`, `update_time`, `expire_time`
+    "SELECT `info_hash`, `ip`, `port`, `uploaded`, `downloaded`, `left`, `update_time`, `expire_time`
        FROM $table
       WHERE `expire_time` > NOW()
       ORDER BY `update_time` DESC
@@ -115,12 +120,13 @@ if (($_GET['format'] ?? '') === 'json') {
         }, $torrents),
         'peers' => array_map(function ($row) {
             $row['info_hash_hex'] = tracker_hex($row['info_hash']);
-            $row['peer_id_hex'] = tracker_hex($row['peer_id']);
-            $row['ip'] = long2ip((int) $row['ip']);
-            unset($row['info_hash'], $row['peer_id']);
+            // Redacted to /24: the swarm shape is useful, a list of
+            // identifiable downloaders is not.
+            $row['ip_network'] = tracker_redact_ip((int) $row['ip']);
+            unset($row['info_hash'], $row['ip']);
             return $row;
         }, $peers),
-    ), JSON_PRETTY_PRINT);
+    ), JSON_PRETTY_PRINT | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
     exit;
 }
 ?>
@@ -317,9 +323,8 @@ if (($_GET['format'] ?? '') === 'json') {
                 <table>
                     <thead>
                     <tr>
-                        <th>IP</th>
+                        <th>Network</th>
                         <th>Port</th>
-                        <th>Peer ID</th>
                         <th>Info Hash</th>
                         <th>Downloaded</th>
                         <th>Left</th>
@@ -330,9 +335,8 @@ if (($_GET['format'] ?? '') === 'json') {
                     <tbody>
                     <?php foreach ($peers as $peer): ?>
                         <tr>
-                            <td><?php echo dashboard_e(long2ip((int) $peer['ip'])); ?></td>
+                            <td><?php echo dashboard_e(tracker_redact_ip((int) $peer['ip'])); ?></td>
                             <td><?php echo dashboard_e($peer['port']); ?></td>
-                            <td><code><?php echo dashboard_e(tracker_hex($peer['peer_id'])); ?></code></td>
                             <td><code><?php echo dashboard_e(tracker_hex($peer['info_hash'])); ?></code></td>
                             <td><?php echo dashboard_e(dashboard_bytes($peer['downloaded'])); ?></td>
                             <td><?php echo dashboard_e(dashboard_bytes($peer['left'])); ?></td>
@@ -347,7 +351,7 @@ if (($_GET['format'] ?? '') === 'json') {
     </section>
 </main>
 <footer>
-    JSON view is available with <code>?format=json</code><?php echo tracker_config('dashboard_key', '') === '' ? '.' : ' and the same dashboard key.'; ?>
+    JSON view is available with <code>?format=json</code> and the same dashboard key. Send the key in an <code>X-Dashboard-Key</code> header rather than the query string so it stays out of access logs.
 </footer>
 </body>
 </html>

@@ -1,0 +1,4 @@
+# Normalise to LF so CRLF churn from Windows checkouts cannot hide content changes.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
