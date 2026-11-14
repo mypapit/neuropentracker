@@ -124,9 +124,10 @@ peers get `tracker is at peer capacity`, while repeat announces and scrapes keep
 working. Because `clean.php` reclaims space, the tracker recovers without a
 restart.
 
-`dbschema.sql` also sets `MAX_ROWS=50000` as a backstop, but MariaDB ignores it
-when the heap limit is lower. The application cap is the effective limit. Before
-you raise `$max_peers`, read `SHOW VARIABLES LIKE 'max_heap_table_size'`.
+`dbschema.sql` also sets `MAX_ROWS=50000` as a backstop. That backstop works only
+while the heap limit is high enough. When the heap limit is lower, MariaDB
+ignores it. The application cap is the effective limit. Before you raise
+`$max_peers`, read `SHOW VARIABLES LIKE 'max_heap_table_size'`.
 
 ### Protocol
 
@@ -185,14 +186,14 @@ The socket address (`REMOTE_ADDR`) is authoritative. The tracker validates `?ip=
 and ignores the value unless `$trust_forwarded_ip` is true.
 
 Any public client can set `?ip=`. When the tracker honored that parameter, one
-extra parameter could satisfy an IP whitelist, dodge an IP blacklist, or inject
-arbitrary `IP:port` pairs into any swarm. Those injected pairs made the tracker a
-reflector aimed at a host the client chose.
+extra parameter let a client pass an IP whitelist or dodge an IP blacklist. It
+also let the client inject arbitrary `IP:port` pairs into any swarm. Those pairs
+made the tracker a reflector aimed at a host the client chose.
 
 The tracker does not infer trust from the remote address. Behind a same-host
-proxy every request arrives as `127.0.0.1`, so such an inference reopens the
-bypass for the deployments most likely to run one. `$trust_forwarded_ip` is an
-explicit opt-in.
+proxy, every request arrives as `127.0.0.1`. An inference based on that address
+reopens the bypass for the deployments most likely to run one.
+`$trust_forwarded_ip` is an explicit opt-in.
 
 The tracker does not resolve hostnames and accepts only IPv4 literals.
 
@@ -228,16 +229,16 @@ Hex forms exist because a peer ID is binary and can contain bytes that a PHP
 string cannot represent literally.
 
 Because the client chooses its own peer ID, a peer ID list can exclude one
-misbehaving client but cannot be a security boundary: one changed byte gives the
-client a new ID. IP lists are applied to the socket address, which the client
-cannot change.
+misbehaving client. It is no security boundary: one changed byte gives the client
+a new ID. IP lists are applied to the socket address, which the client cannot
+change.
 
 ## Scrape
 
 `scrape.php` requires at least one `info_hash` and processes at most 50 per
-request. The parameterless "scrape everything" form is disabled: a 36-byte
+request. The parameterless "scrape everything" form is disabled. A 36-byte
 request expanded into a multi-megabyte response backed by one query per live
-torrent, and the form let anyone enumerate the entire catalog without an
+torrent. The form also let anyone enumerate the entire catalog without an
 announce.
 
 ## Endpoints
